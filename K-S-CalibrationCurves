@@ -1,0 +1,778 @@
+import os
+import re
+import math
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from typing import Optional, Dict
+import re
+
+plt.rcParams['font.family'] = 'Arial'
+plt.rcParams['pdf.fonttype'] = 42
+plt.rcParams['ps.fonttype'] = 42
+plt.rcParams['font.size'] =10
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+ROOT = Path(r"D:\uv_vis\Integrating Sphere Module II Sunday, April 12, 2026 12_57 PM Eastern Daylight Time")
+OUTDIR = ROOT / "processed_adv_analysis"
+OUTDIR.mkdir(exist_ok=True)
+
+ADV_RANGE = [adv for adv in range(16, 33) if adv != 29]   # skip ADV29
+EXPECTED_CONCS = [0.5, 1.0, 2.0, 4.0]
+FWS_TARGETS = [2, 40, 60, 99]
+PLOT_SAMPLE_ESTIMATED_CONC = True   # set False if you do not want sample placed on the calibration curve
+
+# choose which points to SHOW on each calibration plot
+# allowed entries are 0.5, 1, 2, 4, and "sample"
+# remove anything you do not want plotted
+PLOT_SELECTIONS = {
+    16: [0.5, 1, 2, 4],
+    17: [0.5, 1, 2, 4],
+    18: [0.5, 1, 2,"sample"],
+    19: [0.5, 1, 2,"sample"],
+    20: [0.5, 1, 2, 4, "sample"],
+    21: [0.5, 2, 4, "sample"],
+    22: [0.5, 2, "sample"],
+    23: [0.5, 1, 2, "sample"],
+    24: [0.5, 1, 2, 4, "sample"],
+    25: [ 2, 4, "sample"],
+    26: [ 1, 4, "sample"],
+    27: [ 1, 2, 4, "sample"],
+    28: [0.5, 4, "sample"],
+    30: [0.5, 2, 4, "sample"],
+    31: [0.5, 1, 2, 4, "sample"],
+    32: [0.5, 1, 2, "sample"],
+}
+
+
+KS_MIN_WL = 400
+KS_MAX_WL = 700
+
+# ============================================================
+# HELPERS
+# ============================================================
+def normalize_name(s: str) -> str:
+    return s.strip().lower().replace(" ", "").replace("-", "").replace("__", "_")
+
+def bar_color(root: str) -> Optional[str]:
+    """
+    Return a matplotlib color for each root.
+    - Return None to use matplotlib's default color cycle.
+    - Or define a dict mapping to hex codes / named colors.
+    """
+    colors: Dict[str, str] = {
+ 
+        "ADV16": "#ff968a", "ADV17": "#9cbbda", "ADV18": "#ffccd3",
+        "ADV19": "#a593bf", "ADV20": "#cd7385", "ADV21": "#e694b3",
+        "ADV22": "#d98489", "ADV23": "#fbadc4", "ADV24": "#efa475",
+        "ADV25": "#fcbdcf", "ADV26": "#fffa8a", "ADV27": "#fefbc7",
+        "ADV28": "#ffb7cb", "ADV30": "#ffffab", "ADV31": "#fef78e",
+        "ADV32": "#ffc597"
+    
+    }
+    return colors.get(root, None)
+
+
+def get_plot_selection_for_adv(adv):
+    return PLOT_SELECTIONS.get(adv, [0.5, 1, 2, 4, "sample"])
+
+def find_csv_files(root: Path):
+    return sorted(root.glob("*.csv"))
+
+def parse_adv_filename(path: Path):
+    stem = path.stem.lower().strip()
+
+    m_sample = re.match(r"adv\s*([0-9]{1,2})_sample\b", stem)
+    if m_sample:
+        adv = int(m_sample.group(1))
+        return {"type": "adv", "adv": adv, "kind": "sample", "conc": None}
+
+    m_num = re.match(r"adv\s*([0-9]{1,2})_([0-9]*\.?[0-9]+)\b", stem)
+    if m_num:
+        adv = int(m_num.group(1))
+        conc = float(m_num.group(2))
+        return {"type": "adv", "adv": adv, "kind": "standard", "conc": conc}
+
+    return None
+
+def parse_fws_filename(path: Path):
+    stem = path.stem.lower().strip()
+    m = re.match(r"fws[-_ ]?([0-9]{1,3})\b", stem)
+    if m:
+        pct = int(m.group(1))
+        return {"type": "fws", "percent": pct}
+    return None
+
+def is_baseline_file(path: Path):
+    stem = path.stem.lower()
+    return (
+        "100% absorbance baseline" in stem
+        or "0 absorbance baseline" in stem
+        or "100 absorbance baseline" in stem
+        or "0% absorbance baseline" in stem
+    )
+
+def detect_xy_columns(df: pd.DataFrame):
+    numeric_cols = []
+    for c in df.columns:
+        series = pd.to_numeric(df[c], errors="coerce")
+        frac_numeric = series.notna().mean()
+        if frac_numeric > 0.5:
+            numeric_cols.append(c)
+
+    if len(numeric_cols) >= 2:
+        return numeric_cols[0], numeric_cols[1]
+    return None, None
+
+def read_spectrum_csv(path: Path):
+    trials = [
+        dict(header=0),
+        dict(header=None),
+        dict(skiprows=1, header=None),
+        dict(skiprows=2, header=None),
+        dict(skiprows=3, header=None),
+        dict(skiprows=4, header=None),
+        dict(skiprows=5, header=None),
+        dict(skiprows=10, header=None),
+    ]
+
+    best_df = None
+
+    for kwargs in trials:
+        try:
+            df = pd.read_csv(path, **kwargs)
+        except Exception:
+            continue
+
+        if kwargs.get("header", None) is None:
+            df = df.copy()
+            df.columns = [f"col_{i}" for i in range(df.shape[1])]
+
+        xcol, ycol = detect_xy_columns(df)
+        if xcol is None or ycol is None:
+            continue
+
+        out = pd.DataFrame({
+            "wavelength": pd.to_numeric(df[xcol], errors="coerce"),
+            "value": pd.to_numeric(df[ycol], errors="coerce")
+        }).dropna()
+
+        if len(out) < 10:
+            continue
+
+        out = out.sort_values("wavelength").drop_duplicates("wavelength")
+        if out["wavelength"].between(200, 2500).sum() > 10:
+            best_df = out.reset_index(drop=True)
+            break
+
+    if best_df is None:
+        raise ValueError(f"Could not parse spectrum from {path.name}")
+
+    return best_df
+
+def interp_to_reference(x_ref, x, y):
+    return np.interp(x_ref, x, y)
+
+def nearest_value_at(x, y, target):
+    idx = np.argmin(np.abs(np.asarray(x) - target))
+    return float(np.asarray(y)[idx]), float(np.asarray(x)[idx])
+
+def ks_from_reflectance(R):
+    R = np.asarray(R, dtype=float)
+    R = np.clip(R, 1e-8, None)
+    return ((1 - R) ** 2) / (2 * R)
+
+def format_conc_label(c):
+    if c is None:
+        return "sample"
+    if float(c).is_integer():
+        return str(int(c))
+    return str(c)
+
+# ============================================================
+# 1. FIND FILES AND CLASSIFY
+# ============================================================
+all_csvs = find_csv_files(ROOT)
+
+adv_files = {adv: {"standard": {}, "sample": None} for adv in ADV_RANGE}
+fws_files = {}
+baseline_files = []
+unclassified = []
+
+for path in all_csvs:
+    if is_baseline_file(path):
+        baseline_files.append(path)
+        continue
+
+    adv_info = parse_adv_filename(path)
+    if adv_info is not None:
+        adv = adv_info["adv"]
+        if adv in adv_files:
+            if adv_info["kind"] == "sample":
+                adv_files[adv]["sample"] = path
+            else:
+                adv_files[adv]["standard"][adv_info["conc"]] = path
+        else:
+            unclassified.append(path)
+        continue
+
+    fws_info = parse_fws_filename(path)
+    if fws_info is not None:
+        fws_files[fws_info["percent"]] = path
+        continue
+
+    unclassified.append(path)
+
+# ============================================================
+# 2. SUMMARIZE ADV FILES
+# ============================================================
+summary_rows = []
+for adv in ADV_RANGE:
+    row = {"ADV": f"ADV{adv}"}
+    for conc in EXPECTED_CONCS:
+        row[f"{format_conc_label(conc)}"] = adv_files[adv]["standard"].get(conc, None) is not None
+    row["sample"] = adv_files[adv]["sample"] is not None
+    summary_rows.append(row)
+
+summary_df = pd.DataFrame(summary_rows)
+summary_df.to_csv(OUTDIR / "adv_file_summary.csv", index=False)
+
+missing_rows = []
+for adv in ADV_RANGE:
+    for conc in EXPECTED_CONCS:
+        if conc not in adv_files[adv]["standard"]:
+            missing_rows.append({"ADV": f"ADV{adv}", "missing": format_conc_label(conc)})
+    if adv_files[adv]["sample"] is None:
+        missing_rows.append({"ADV": f"ADV{adv}", "missing": "sample"})
+
+missing_df = pd.DataFrame(missing_rows)
+missing_df.to_csv(OUTDIR / "adv_missing_files.csv", index=False)
+
+print("\n========== ADV FILE SUMMARY ==========")
+print(summary_df.to_string(index=False))
+
+# ============================================================
+# 3. FIND BASELINE FILE
+# ============================================================
+baseline_path = None
+if len(baseline_files) == 0:
+    print("\nWARNING: No baseline file found. Baseline subtraction will be skipped.")
+elif len(baseline_files) == 1:
+    baseline_path = baseline_files[0]
+else:
+    preferred = [p for p in baseline_files if "100" in p.stem.lower()]
+    baseline_path = preferred[0] if preferred else baseline_files[0]
+    print("\nWARNING: Multiple baseline files found. Using:", baseline_path.name)
+
+baseline_df = None
+if baseline_path is not None:
+    baseline_df = read_spectrum_csv(baseline_path)
+    baseline_df.to_csv(OUTDIR / "baseline_used.csv", index=False)
+    print("Using baseline:", baseline_path.name)
+
+# ============================================================
+# 4. READ AND BASELINE-CORRECT ADV FILES
+# ============================================================
+adv_spectra = {}
+
+for adv in ADV_RANGE:
+    adv_spectra[adv] = {"standard": {}, "sample": None}
+
+    for conc, path in adv_files[adv]["standard"].items():
+        spec = read_spectrum_csv(path)
+
+        if baseline_df is not None:
+            baseline_interp = interp_to_reference(
+                spec["wavelength"].values,
+                baseline_df["wavelength"].values,
+                baseline_df["value"].values
+            )
+            corrected = spec["value"].values - baseline_interp
+        else:
+            corrected = spec["value"].values.copy()
+
+        spec_out = pd.DataFrame({
+            "wavelength": spec["wavelength"].values,
+            "raw_value": spec["value"].values,
+            "baseline_corrected": corrected
+        })
+
+        adv_spectra[adv]["standard"][conc] = {
+            "path": path,
+            "df": spec_out
+        }
+
+        spec_out.to_csv(OUTDIR / f"ADV{adv}_{format_conc_label(conc)}_baseline_corrected.csv", index=False)
+
+    if adv_files[adv]["sample"] is not None:
+        path = adv_files[adv]["sample"]
+        spec = read_spectrum_csv(path)
+
+        if baseline_df is not None:
+            baseline_interp = interp_to_reference(
+                spec["wavelength"].values,
+                baseline_df["wavelength"].values,
+                baseline_df["value"].values
+            )
+            corrected = spec["value"].values - baseline_interp
+        else:
+            corrected = spec["value"].values.copy()
+
+        spec_out = pd.DataFrame({
+            "wavelength": spec["wavelength"].values,
+            "raw_value": spec["value"].values,
+            "baseline_corrected": corrected
+        })
+
+        adv_spectra[adv]["sample"] = {
+            "path": path,
+            "df": spec_out
+        }
+
+        spec_out.to_csv(OUTDIR / f"ADV{adv}_sample_baseline_corrected.csv", index=False)
+
+# ============================================================
+# 5. READ AND BASELINE-CORRECT FWS FILES
+# ============================================================
+fws_spectra = {}
+
+for pct, path in fws_files.items():
+    spec = read_spectrum_csv(path)
+
+    if baseline_df is not None:
+        baseline_interp = interp_to_reference(
+            spec["wavelength"].values,
+            baseline_df["wavelength"].values,
+            baseline_df["value"].values
+        )
+        corrected = spec["value"].values - baseline_interp
+    else:
+        corrected = spec["value"].values.copy()
+
+    spec_out = pd.DataFrame({
+        "wavelength": spec["wavelength"].values,
+        "raw_value": spec["value"].values,
+        "baseline_corrected": corrected
+    })
+
+    fws_spectra[pct] = {
+        "path": path,
+        "df": spec_out
+    }
+
+    spec_out.to_csv(OUTDIR / f"FWS_{pct}_baseline_corrected.csv", index=False)
+
+missing_fws = [x for x in FWS_TARGETS if x not in fws_spectra]
+if missing_fws:
+    print("\nWARNING: Missing FWS files:", missing_fws)
+
+# ============================================================
+# 6. PLOT BASELINE-CORRECTED FWS SPECTRA
+# ============================================================
+if len(fws_spectra) > 0:
+    plt.figure(figsize=(8, 6), dpi=300)
+    for pct in sorted(fws_spectra):
+        df = fws_spectra[pct]["df"]
+        plt.plot(df["wavelength"], df["baseline_corrected"], label=f"FWS-{pct}")
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Baseline-corrected reflectance")
+    plt.title("FWS Reflectance Spectra (baseline-corrected)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTDIR / "FWS_all_reflectance_spectra_baseline_corrected.png", bbox_inches="tight")
+    plt.close()
+
+# ============================================================
+# 7. FWS REFLECTANCE AT 700 NM
+# ============================================================
+fws_700_rows = []
+for pct in sorted(fws_spectra):
+    df = fws_spectra[pct]["df"]
+    y700, xused = nearest_value_at(df["wavelength"], df["baseline_corrected"], 700)
+    fws_700_rows.append({
+        "fws_percent": pct,
+        "wavelength_used_nm": xused,
+        "reflectance_at_700nm": y700
+    })
+
+fws_700_df = pd.DataFrame(fws_700_rows).sort_values("fws_percent")
+fws_700_df.to_csv(OUTDIR / "FWS_reflectance_at_700nm_baseline_corrected.csv", index=False)
+
+if len(fws_700_df) > 0:
+    plt.figure(figsize=(6, 5), dpi=300)
+    plt.plot(fws_700_df["fws_percent"], fws_700_df["reflectance_at_700nm"], "o-")
+    plt.xlabel("Absolute reflectance standard (%)")
+    plt.ylabel("Reflectance at 700 nm")
+    plt.title("Reflectance at 700 nm vs FWS level")
+    plt.tight_layout()
+    plt.savefig(OUTDIR / "FWS_700nm_vs_absolute_reflectance.png", bbox_inches="tight")
+    plt.close()
+
+# ============================================================
+# 8. USE BASELINE-CORRECTED FWS-99 AS REFERENCE
+# ============================================================
+if 99 not in fws_spectra:
+    raise FileNotFoundError("FWS-99.csv not found. Needed for normalization.")
+
+fws99_df = fws_spectra[99]["df"]
+
+# ============================================================
+# 9. CALCULATE K/S FROM BASELINE-CORRECTED ADV / FWS99
+# ============================================================
+calibration_rows = []
+
+for adv in ADV_RANGE:
+    # standards
+    for conc, item in adv_spectra[adv]["standard"].items():
+        df = item["df"]
+
+        ref = interp_to_reference(
+            df["wavelength"].values,
+            fws99_df["wavelength"].values,
+            fws99_df["baseline_corrected"].values
+        )
+
+        sample_refl = df["baseline_corrected"].values
+        R_frac = sample_refl / np.clip(ref, 1e-8, None)
+        R_frac = np.clip(R_frac, 1e-8, None)
+
+        # only use 400–700 nm for minimum reflectance
+        mask_400_700 = (df["wavelength"].values >= 400) & (df["wavelength"].values <= 700)
+
+        if np.any(mask_400_700):
+            R_min = np.min(R_frac[mask_400_700])
+        else:
+            R_min = np.nan
+
+        ks_val = ks_from_reflectance(R_min) if np.isfinite(R_min) else np.nan
+
+        out = df.copy()
+        out["fws99_baseline_corrected_interp"] = ref
+        out["reflectance_fraction_vs_fws99"] = R_frac
+        out.to_csv(OUTDIR / f"ADV{adv}_{format_conc_label(conc)}_normalized_vs_FWS99.csv", index=False)
+
+        calibration_rows.append({
+            "ADV": f"ADV{adv}",
+            "adv_num": adv,
+            "kind": "standard",
+            "concentration": conc,
+            "min_fractional_reflectance": R_min,
+            "KS": ks_val,
+            "file": item["path"].name
+        })
+
+    # sample
+    if adv_spectra[adv]["sample"] is not None:
+        item = adv_spectra[adv]["sample"]
+        df = item["df"]
+
+        ref = interp_to_reference(
+            df["wavelength"].values,
+            fws99_df["wavelength"].values,
+            fws99_df["baseline_corrected"].values
+        )
+
+        sample_refl = df["baseline_corrected"].values
+        R_frac = sample_refl / np.clip(ref, 1e-8, None)
+        R_frac = np.clip(R_frac, 1e-8, None)
+
+        # only use 400–700 nm for minimum reflectance
+        mask_400_700 = (df["wavelength"].values >= 400) & (df["wavelength"].values <= 700)
+
+        if np.any(mask_400_700):
+            R_min = np.min(R_frac[mask_400_700])
+        else:
+            R_min = np.nan
+
+        ks_val = ks_from_reflectance(R_min) if np.isfinite(R_min) else np.nan
+
+        out = df.copy()
+        out["fws99_baseline_corrected_interp"] = ref
+        out["reflectance_fraction_vs_fws99"] = R_frac
+        out.to_csv(OUTDIR / f"ADV{adv}_sample_normalized_vs_FWS99.csv", index=False)
+
+        calibration_rows.append({
+            "ADV": f"ADV{adv}",
+            "adv_num": adv,
+            "kind": "sample",
+            "concentration": np.nan,
+            "min_fractional_reflectance": R_min,
+            "KS": ks_val,
+            "file": item["path"].name
+        })
+
+calibration_df = pd.DataFrame(calibration_rows).sort_values(["adv_num", "kind", "concentration"], na_position="last")
+calibration_df.to_csv(OUTDIR / "ADV_KS_summary.csv", index=False)
+
+# ============================================================
+# 10. LINEAR FITS FOR STANDARDS ONLY
+# ============================================================
+fit_rows = []
+
+for adv in ADV_RANGE:
+    # sub = calibration_df[(calibration_df["adv_num"] == adv) & (calibration_df["kind"] == "standard")].copy()
+    # sub = sub.dropna(subset=["concentration", "KS"]).sort_values("concentration")
+    selected_items = get_plot_selection_for_adv(adv)
+    selected_concs = [x for x in selected_items if x != "sample"]
+
+    sub = calibration_df[
+        (calibration_df["adv_num"] == adv) &
+        (calibration_df["kind"] == "standard") &
+        (calibration_df["concentration"].isin(selected_concs))
+    ].copy()
+
+    sub = sub.dropna(subset=["concentration", "KS"]).sort_values("concentration")
+
+    if len(sub) >= 2:
+        x = sub["concentration"].values.astype(float)
+        y = sub["KS"].values.astype(float)
+        slope, intercept = np.polyfit(x, y, 1)
+
+        y_pred = slope * x + intercept
+        ss_res = np.sum((y - y_pred) ** 2)
+        ss_tot = np.sum((y - np.mean(y)) ** 2)
+        r2 = np.nan if ss_tot == 0 else 1 - (ss_res / ss_tot)
+    else:
+        slope, intercept, r2 = np.nan, np.nan, np.nan
+
+    fit_rows.append({
+        "ADV": f"ADV{adv}",
+        "adv_num": adv,
+        "slope": slope,
+        "intercept": intercept,
+        "R2": r2,
+        "n_fit_points": len(sub)
+    })
+
+fit_df = pd.DataFrame(fit_rows)
+fit_df.to_csv(OUTDIR / "ADV_KS_linear_fits.csv", index=False)
+
+# ============================================================
+# 11. ESTIMATE SAMPLE CONCENTRATION FROM FIT
+# ============================================================
+sample_est_rows = []
+for adv in ADV_RANGE:
+    sub_sam = calibration_df[(calibration_df["adv_num"] == adv) & (calibration_df["kind"] == "sample")]
+    sub_fit = fit_df[fit_df["adv_num"] == adv].iloc[0]
+
+    if len(sub_sam) > 0 and np.isfinite(sub_fit["slope"]) and sub_fit["slope"] != 0:
+        ks_sample = sub_sam["KS"].iloc[0]
+        est_conc = (ks_sample - sub_fit["intercept"]) / sub_fit["slope"]
+    else:
+        ks_sample = sub_sam["KS"].iloc[0] if len(sub_sam) > 0 else np.nan
+        est_conc = np.nan
+
+    sample_est_rows.append({
+        "ADV": f"ADV{adv}",
+        "sample_KS": ks_sample,
+        "estimated_concentration_from_fit": est_conc
+    })
+
+sample_est_df = pd.DataFrame(sample_est_rows)
+sample_est_df.to_csv(OUTDIR / "ADV_sample_estimated_concentration.csv", index=False)
+
+# ============================================================
+# 12. INDIVIDUAL CALIBRATION PLOTS
+# ============================================================
+for adv in ADV_RANGE:
+    # sub_std = calibration_df[(calibration_df["adv_num"] == adv) & (calibration_df["kind"] == "standard")].copy().sort_values("concentration")
+    # sub_sam = calibration_df[(calibration_df["adv_num"] == adv) & (calibration_df["kind"] == "sample")].copy()
+    selected_items = get_plot_selection_for_adv(adv)
+    selected_concs = [x for x in selected_items if x != "sample"]
+    plot_sample = "sample" in selected_items
+
+    sub_std = calibration_df[
+        (calibration_df["adv_num"] == adv) &
+        (calibration_df["kind"] == "standard") &
+        (calibration_df["concentration"].isin(selected_concs))
+    ].copy().sort_values("concentration")
+
+    sub_sam = calibration_df[
+        (calibration_df["adv_num"] == adv) &
+        (calibration_df["kind"] == "sample")
+    ].copy()
+
+    if not plot_sample:
+        sub_sam = sub_sam.iloc[0:0]
+    sub_fit = fit_df[fit_df["adv_num"] == adv].iloc[0]
+    sub_est = sample_est_df[sample_est_df["ADV"] == f"ADV{adv}"].iloc[0]
+
+    plt.figure(figsize=(5, 4), dpi=300)
+
+    if len(sub_std) > 0:
+        plt.plot(sub_std["concentration"], sub_std["KS"], "o", label="standards")
+
+    if len(sub_std) >= 2 and np.isfinite(sub_fit["slope"]):
+        xfit = np.linspace(0.5, 4.0, 100)
+        yfit = sub_fit["slope"] * xfit + sub_fit["intercept"]
+        plt.plot(xfit, yfit, "-", label=f"fit, R²={sub_fit['R2']:.3f}")
+
+    if len(sub_sam) > 0:
+        sample_ks = sub_sam["KS"].iloc[0]
+        est_conc = sub_est["estimated_concentration_from_fit"]
+
+        if PLOT_SAMPLE_ESTIMATED_CONC and np.isfinite(est_conc):
+            plt.plot(est_conc, sample_ks, "s", label="sample")
+        else:
+            plt.scatter([], [], marker="s", label="sample")
+
+        plt.text(
+            0.98, 0.05,
+            f"sample K/S = {sample_ks:.3f}",
+            transform=plt.gca().transAxes,
+            ha="right", va="bottom",
+            fontsize=10,
+            bbox=dict(facecolor="white", edgecolor="black", alpha=0.8)
+        )
+
+    plt.xticks([0.5, 1, 2, 4], ["0.5", "1", "2", "4"])
+    plt.xlabel("Concentration")
+    plt.ylabel("K/S")
+    plt.title(f"ADV{adv} calibration")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTDIR / f"ADV{adv}_calibration.png", bbox_inches="tight")
+    plt.close()
+
+# ============================================================
+# 13. 4x4 FIGURES
+# ============================================================
+# ============================================================
+# 13. 4x4 FIGURES
+# ============================================================
+adv_list = ADV_RANGE[:]
+page_size = 16
+n_pages = math.ceil(len(adv_list) / page_size)
+
+panel_labels = [chr(ord("a") + i) for i in range(16)]  # a, b, c, ... p
+
+for page in range(n_pages):
+    subset = adv_list[page * page_size:(page + 1) * page_size]
+
+    fig, axes = plt.subplots(4, 4, figsize=(7, 7), dpi=1200)
+    axes = axes.flatten()
+
+    for i, (ax, adv) in enumerate(zip(axes, subset)):
+        selected_items = get_plot_selection_for_adv(adv)
+        selected_concs = [x for x in selected_items if x != "sample"]
+        plot_sample = "sample" in selected_items
+
+        sub_std = calibration_df[
+            (calibration_df["adv_num"] == adv) &
+            (calibration_df["kind"] == "standard") &
+            (calibration_df["concentration"].isin(selected_concs))
+        ].copy().sort_values("concentration")
+
+        sub_sam = calibration_df[
+            (calibration_df["adv_num"] == adv) &
+            (calibration_df["kind"] == "sample")
+        ].copy()
+
+        if not plot_sample:
+            sub_sam = sub_sam.iloc[0:0]
+
+        sub_fit = fit_df[fit_df["adv_num"] == adv].iloc[0]
+        sub_est = sample_est_df[sample_est_df["ADV"] == f"ADV{adv}"].iloc[0]
+
+        adv_name = f"ADV{adv}"
+        this_color = bar_color(adv_name)
+
+        # standards: colored circles with black edge
+        if len(sub_std) > 0:
+            ax.scatter(
+                sub_std["concentration"],
+                sub_std["KS"],
+                s=45,
+                facecolor=this_color,
+                edgecolor="black",
+                linewidth=0.8,
+                zorder=3
+            )
+
+        # fit line
+        if len(sub_std) >= 2 and np.isfinite(sub_fit["slope"]):
+            xfit = np.linspace(0.5, 4.0, 100)
+            yfit = sub_fit["slope"] * xfit + sub_fit["intercept"]
+            ax.plot(xfit, yfit, "-", color="black", linewidth=1.0, zorder=2)
+
+        # sample point
+        if len(sub_sam) > 0:
+            sample_ks = sub_sam["KS"].iloc[0]
+            est_conc = sub_est["estimated_concentration_from_fit"]
+
+            if PLOT_SAMPLE_ESTIMATED_CONC and np.isfinite(est_conc):
+                ax.scatter(
+                    [est_conc],
+                    [sample_ks],
+                    s=55,
+                    marker="s",
+                    facecolor=this_color,
+                    edgecolor="black",
+                    linewidth=0.8,
+                    zorder=4
+                )
+
+            ax.text(
+                0.98, 0.05,
+                f"sample K/S={sample_ks:.2f}",
+                transform=ax.transAxes,
+                ha="right", va="bottom",
+                fontsize=10,
+                bbox=dict(facecolor="white", edgecolor="black", alpha=0.8)
+            )
+
+        # panel label only, no ADV title
+        ax.text(
+            0.03, 0.97,
+            f"({panel_labels[i]})",
+            transform=ax.transAxes,
+            ha="left", va="top",
+            fontsize=10,
+            
+        )
+
+        ax.set_xlim(0, 4.5)
+        ax.set_xticks([0, 1, 2, 3, 4])
+        ax.set_xlabel("Conc.")
+        ax.set_ylabel("K/S")
+        ax.tick_params(labelsize=8)
+
+        if len(sub_std) == 0:
+            ax.text(
+                0.5, 0.5, "no standards",
+                ha="center", va="center",
+                transform=ax.transAxes
+            )
+
+    for j in range(len(subset), 16):
+        axes[j].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(OUTDIR / f"ADV_calibration_grid_page_{page + 1}.png", bbox_inches="tight")
+    plt.close()
+# ============================================================
+# 14. TEXT SUMMARY
+# ============================================================
+summary_txt = []
+summary_txt.append(f"Root folder: {ROOT}")
+summary_txt.append(f"Total CSV files found: {len(all_csvs)}")
+summary_txt.append(f"Baseline used: {baseline_path.name if baseline_path else 'None'}")
+summary_txt.append(f"FWS files found: {sorted(fws_files.keys())}")
+summary_txt.append("")
+summary_txt.append("ADV coverage:")
+
+for adv in ADV_RANGE:
+    found_std = sorted(adv_files[adv]["standard"].keys())
+    has_sample = adv_files[adv]["sample"] is not None
+    summary_txt.append(
+        f"  ADV{adv}: standards={found_std if found_std else 'none'}, sample={'yes' if has_sample else 'no'}"
+    )
+
+with open(OUTDIR / "processing_summary.txt", "w", encoding="utf-8") as f:
+    f.write("\n".join(summary_txt))
+
+print("\nDone.")
+print("Outputs saved to:", OUTDIR)
