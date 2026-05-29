@@ -1,0 +1,249 @@
+"""
+Convert UV-Vis absorbance spectra to approximate visible RGB colors.
+
+This script:
+1. Loads absorbance spectra for selected ADV dye samples.
+2. Converts absorbance to transmittance.
+3. Converts transmittance spectra to CIE XYZ using color matching functions.
+4. Converts XYZ values to sRGB.
+5. Plots a color swatch panel and saves it as a PDF.
+
+Author: Natalie Mamrol
+"""
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
+
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+
+CIE_CMF_FILE = Path(
+    r"C:\Users\ndmamrol\MIT Dropbox\Natalie Mamrol"
+    r"\Disperse Dyes\color_groupmeeting\cie-cmf.txt"
+)
+
+SPECTRA_DIR = Path(
+    r"C:\Users\ndmamrol\MIT Dropbox\Natalie Mamrol"
+    r"\Disperse Dyes\color_groupmeeting\separated_samples"
+)
+
+OUTPUT_DIR = Path(
+    r"C:\Users\ndmamrol\OneDrive - Massachusetts Institute of Technology"
+    r"\Graduate School\Polymer Science Research"
+    r"\biodeg_add_paper\Disperse Dyes\pdf"
+)
+
+OUTPUT_NAME = "colors.pdf"
+
+SAMPLES = [f"ADV_{i}" for i in range(16, 33)]
+
+VISIBLE_MIN_NM = 380
+VISIBLE_MAX_NM = 780
+
+
+# ============================================================
+# COLOR CONVERSION FUNCTIONS
+# ============================================================
+
+def absorbance_to_transmittance(absorbance):
+    """
+    Convert absorbance to transmittance.
+
+    A = -log10(T), so T = 10^(-A).
+    """
+    return 10 ** (-absorbance)
+
+
+def load_cie_color_matching_functions(cie_cmf_file):
+    """
+    Load CIE color matching function data.
+
+    Expected file columns:
+        wavelength_nm, x_bar, y_bar, z_bar
+    """
+    cie_data = np.loadtxt(cie_cmf_file)
+
+    return cie_data[:, 0], cie_data[:, 1:4]
+
+
+def transmittance_to_xyz(transmittance, wavelengths, cie_wavelengths, cie_cmf):
+    """
+    Convert transmittance spectrum to approximate CIE XYZ values.
+    """
+    interpolator = interp1d(
+        cie_wavelengths,
+        cie_cmf,
+        axis=0,
+        kind="linear",
+        fill_value="extrapolate",
+    )
+
+    cie_interp = interpolator(wavelengths)
+
+    xyz = np.sum(cie_interp * transmittance[:, None], axis=0)
+
+    normalization = np.sum(cie_interp[:, 1])
+
+    if normalization == 0:
+        return np.array([0.0, 0.0, 0.0])
+
+    return xyz / normalization
+
+
+def xyz_to_srgb(xyz):
+    """
+    Convert CIE XYZ to sRGB.
+    """
+    xyz_to_rgb_matrix = np.array([
+        [3.2406, -1.5372, -0.4986],
+        [-0.9689, 1.8758, 0.0415],
+        [0.0557, -0.2040, 1.0570],
+    ])
+
+    rgb_linear = xyz_to_rgb_matrix @ xyz
+
+    rgb = np.where(
+        rgb_linear <= 0.0031308,
+        12.92 * rgb_linear,
+        1.055 * np.power(np.clip(rgb_linear, 0, None), 1 / 2.4) - 0.055,
+    )
+
+    return np.clip(rgb, 0, 1)
+
+
+# ============================================================
+# DATA LOADING
+# ============================================================
+
+def load_sample_spectrum(filepath):
+    """
+    Load a sample UV-Vis spectrum CSV.
+
+    Expected columns:
+        Wavelength, Absorbance
+    """
+    df = pd.read_csv(filepath)
+
+    required_columns = {"Wavelength", "Absorbance"}
+    missing = required_columns - set(df.columns)
+
+    if missing:
+        raise ValueError(f"Missing columns in {filepath.name}: {missing}")
+
+    df["Wavelength"] = pd.to_numeric(df["Wavelength"], errors="coerce")
+    df["Absorbance"] = pd.to_numeric(df["Absorbance"], errors="coerce")
+
+    df = df.dropna(subset=["Wavelength", "Absorbance"])
+
+    df = df[
+        (df["Wavelength"] >= VISIBLE_MIN_NM)
+        & (df["Wavelength"] <= VISIBLE_MAX_NM)
+    ]
+
+    return df["Wavelength"].values, df["Absorbance"].values
+
+
+def sample_to_rgb(sample_name, spectra_dir, cie_wavelengths, cie_cmf):
+    """
+    Convert one sample spectrum to approximate sRGB.
+    """
+    filepath = spectra_dir / f"{sample_name}.csv"
+
+    if not filepath.exists():
+        print(f"[warning] Missing file: {filepath}")
+        return None
+
+    wavelengths, absorbance = load_sample_spectrum(filepath)
+
+    if len(wavelengths) == 0:
+        print(f"[warning] No visible-range data for {sample_name}")
+        return None
+
+    transmittance = absorbance_to_transmittance(absorbance)
+
+    xyz = transmittance_to_xyz(
+        transmittance,
+        wavelengths,
+        cie_wavelengths,
+        cie_cmf,
+    )
+
+    return xyz_to_srgb(xyz)
+
+
+# ============================================================
+# PLOTTING
+# ============================================================
+
+def plot_color_swatches(rgb_colors, sample_titles, output_path):
+    """
+    Plot color swatches for each sample.
+    """
+    n_samples = len(rgb_colors)
+
+    fig, axes = plt.subplots(
+        1,
+        n_samples,
+        figsize=(max(n_samples, 4), 2),
+    )
+
+    if n_samples == 1:
+        axes = [axes]
+
+    for ax, rgb, title in zip(axes, rgb_colors, sample_titles):
+        ax.imshow([[rgb]])
+        ax.axis("off")
+        ax.set_title(title, fontsize=8, rotation=90, va="bottom")
+
+    plt.tight_layout()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig.savefig(output_path, format="pdf", bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved: {output_path}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    cie_wavelengths, cie_cmf = load_cie_color_matching_functions(CIE_CMF_FILE)
+
+    rgb_colors = []
+    sample_titles = []
+
+    for sample_name in SAMPLES:
+        rgb = sample_to_rgb(
+            sample_name,
+            SPECTRA_DIR,
+            cie_wavelengths,
+            cie_cmf,
+        )
+
+        if rgb is None:
+            continue
+
+        rgb_colors.append(rgb)
+        sample_titles.append(sample_name)
+
+    if len(rgb_colors) == 0:
+        raise ValueError("No valid sample spectra were found.")
+
+    plot_color_swatches(
+        rgb_colors=np.array(rgb_colors),
+        sample_titles=sample_titles,
+        output_path=OUTPUT_DIR / OUTPUT_NAME,
+    )
+
+
+if __name__ == "__main__":
+    main()
