@@ -1,0 +1,595 @@
+# -*- coding: utf-8 -*-
+"""
+ADV UV–Vis reflectance processing:
+- Load ADV0 (white/undyed) and ADV# (dyed).
+- Optional baseline subtraction (baseline.csv).
+- Compute delta_raw = ADV0_bl - ADV#_bl.
+- Treat delta_raw (clipped >=0) as an "absorbance-like" curve A_raw(λ).
+- Normalize A_raw to [0,1] -> A_norm.
+- Convert to a spectral transmittance factor: T(λ) = 10^(-K * A_norm).
+- Compute color from T(λ) using CMFs and an illuminant (E or file), with Bradford adaptation to D65.
+- Plot + save outputs.
+
+
+"""
+
+import os
+import re
+import glob
+import numpy as np
+import matplotlib.pyplot as plt
+import string
+plt.rcParams['font.family'] = 'Arial'
+plt.rcParams['pdf.fonttype'] = 42
+plt.rcParams['ps.fonttype'] = 42
+plt.rcParams['font.size'] =10
+# ============================================================
+# USER SETTINGS
+# ============================================================
+DATA_FOLDER = r"C:\Users\ndmamrol\OneDrive - Massachusetts Institute of Technology\Graduate Schoocd .l\Polymer Science Research\biodeg_add_paper\Disperse Dyes\uv-vis_reflectance"
+CMF_PATH = r"C:\Users\ndmamrol\MIT Dropbox\Natalie Mamrol\Disperse Dyes\color_groupmeeting\cie-cmf.txt"
+PDF_OUTDIR = r"C:\Users\ndmamrol\OneDrive - Massachusetts Institute of Technology\Graduate School\Polymer Science Research\biodeg_add_paper\manuscript\adv_man_v1\uv-vis_reflection plots"
+
+WL_MIN, WL_MAX = 350, 850
+GRID_STEP_NM = 2
+
+AUTO_NORMALIZE_PERCENT = True
+
+# Baseline subtraction
+USE_BASELINE = True
+BASELINE_FILENAME = "baseline.csv"  # in DATA_FOLDER
+
+# Illuminant
+ILLUMINANT_MODE = "E"    # "E" or "FILE"
+ILLUMINANT_FILE = ""     # if mode="FILE", set path to 2-col: wavelength_nm, relative_power
+
+# Absorbance normalization + mapping
+# After normalizing A_raw -> A_norm in [0,1], convert to transmittance factor:
+#   T = 10^(-K * A_norm)
+K_ABSORBANCE = 1   # bigger => more saturated/darker color (try 1.0–4.0)
+
+# Plotting
+SAVE_PLOTS = True
+SHOW_PLOTS = True
+PLOT_DPI = 250
+PLOT_FORMAT = "png"
+
+EPS = 1e-12
+
+# ============================================================
+# Helpers: file parsing
+# # ============================================================
+
+ADV_LABEL_MAP = {
+    "ADV16": "Disperse Red 135",
+    "ADV17": "Disperse Blue 27",
+    "ADV18": "Disperse Red 277",
+    "ADV19": "Disperse Violet 57",
+    "ADV20": "Disperse Red 82",
+    "ADV21": "Disperse Red 60",
+    "ADV22": "Disperse Red 65",
+    "ADV23": "Disperse Red 4",
+    "ADV24": "Disperse Orange 30",
+    "ADV25": "Disperse Red 191",
+    "ADV26": "Disperse Dye 11",
+    "ADV27": "Disperse Dye 12",
+    "ADV28": "Disperse Dye 13",
+    "ADV30": "Disperse Yellow 114",
+    "ADV31": "Disperse Dye 15",
+    "ADV32": "Disperse Orange 25",
+}
+
+def adv_id_and_label_from_filename(path: str):
+    """
+    Returns (adv_id, label)
+    Example: "sample_ADV16.csv" -> ("ADV16", "Disperse Red 1")
+    """
+    m = re.search(r"(ADV\s*0|ADV\s*\d+)", os.path.basename(path), re.IGNORECASE)
+    if not m:
+        return None, None
+
+    adv_id = m.group(1).replace(" ", "").upper()
+    label = ADV_LABEL_MAP.get(adv_id, adv_id)  # fallback to ADV#
+
+    return adv_id, label
+
+def read_two_col_spectrum(path: str):
+    for delim in [",", "\t", ";", None]:
+        try:
+            arr = np.genfromtxt(path, delimiter=delim, comments="#")
+            if arr.ndim != 2 or arr.shape[1] < 2:
+                continue
+            wl = arr[:, 0].astype(float)
+            y  = arr[:, 1].astype(float)
+            m = np.isfinite(wl) & np.isfinite(y)
+            wl, y = wl[m], y[m]
+            idx = np.argsort(wl)
+            return wl[idx], y[idx]
+        except Exception:
+            continue
+    raise ValueError(f"Could not read spectrum: {path}")
+
+def clip_and_normalize(wl, y, wl_min, wl_max):
+    m = (wl >= wl_min) & (wl <= wl_max) & np.isfinite(y)
+    wl2, y2 = wl[m], y[m]
+    if wl2.size < 5:
+        raise ValueError("Too few points after clipping.")
+    if AUTO_NORMALIZE_PERCENT and np.nanmax(y2) > 1.5:
+        y2 = y2 / 100.0
+    return wl2, y2
+
+def interp_to_grid(wl, y, grid_nm):
+    return np.interp(grid_nm, wl, y, left=y[0], right=y[-1])
+
+def load_baseline(grid_nm):
+    if not USE_BASELINE:
+        return None, None
+    fp = os.path.join(DATA_FOLDER, BASELINE_FILENAME)
+    if not os.path.exists(fp):
+        print(f"NOTE: baseline not found ({fp}). Skipping baseline subtraction.")
+        return None, None
+    wl, y = read_two_col_spectrum(fp)
+    #wl, y = clip_and_normalize(wl, y, WL_MIN, WL_MAX)
+    base = interp_to_grid(wl, y, grid_nm)
+    return fp, base
+
+def subtract_baseline(y, baseline_grid):
+    if baseline_grid is None:
+        return y
+    return np.maximum(y - baseline_grid, 0.0)
+
+# ============================================================
+# Absorbance normalization + mapping to transmittance factor
+# ============================================================
+def normalize_to_0_1(a):
+    a = np.asarray(a, float)
+    a = np.where(np.isfinite(a), a, 0.0)
+    a_min = np.min(a)
+    a_max = np.max(a)
+    rng = a_max - a_min
+    if rng < EPS:
+        return np.zeros_like(a)
+    return (a - a_min) / rng
+
+def absorbance_norm_to_transmittance(A_norm, k=2.0):
+    A_norm = np.clip(np.asarray(A_norm, float), 0.0, 1.0)
+    # Beer-Lambert-ish mapping (shape only)
+    T = 10.0 ** (-k * A_norm)
+    return np.clip(T, 0.0, 1.0)
+
+# ============================================================
+# COLOR: CMFs + illuminant + XYZ -> Bradford -> sRGB
+# ============================================================
+def load_cmf_to_grid(cmf_path: str, grid_nm: np.ndarray):
+    arr = None
+    for delim in [None, ",", "\t", ";"]:
+        try:
+            arr = np.genfromtxt(cmf_path, delimiter=delim, comments="#")
+            if arr.ndim == 2 and arr.shape[1] >= 4:
+                break
+        except Exception:
+            continue
+    if arr is None or arr.ndim != 2 or arr.shape[1] < 4:
+        raise ValueError(f"CMF file not understood: {cmf_path}")
+
+    wl = arr[:, 0].astype(float)
+    xbar = arr[:, 1].astype(float)
+    ybar = arr[:, 2].astype(float)
+    zbar = arr[:, 3].astype(float)
+
+    m = np.isfinite(wl) & np.isfinite(xbar) & np.isfinite(ybar) & np.isfinite(zbar)
+    wl, xbar, ybar, zbar = wl[m], xbar[m], ybar[m], zbar[m]
+    idx = np.argsort(wl)
+    wl, xbar, ybar, zbar = wl[idx], xbar[idx], ybar[idx], zbar[idx]
+
+    xg = np.interp(grid_nm, wl, xbar, left=0.0, right=0.0)
+    yg = np.interp(grid_nm, wl, ybar, left=0.0, right=0.0)
+    zg = np.interp(grid_nm, wl, zbar, left=0.0, right=0.0)
+    return xg, yg, zg
+
+def load_illuminant_to_grid(mode: str, grid_nm: np.ndarray):
+    if mode.upper() == "E":
+        return np.ones_like(grid_nm, dtype=float)
+    if mode.upper() == "FILE":
+        if not ILLUMINANT_FILE or not os.path.exists(ILLUMINANT_FILE):
+            raise FileNotFoundError("ILLUMINANT_MODE='FILE' but ILLUMINANT_FILE path is missing/invalid.")
+        wl, p = read_two_col_spectrum(ILLUMINANT_FILE)
+        p = np.maximum(p, 0.0)
+        pg = np.interp(grid_nm, wl, p, left=p[0], right=p[-1])
+        return pg
+    raise ValueError("ILLUMINANT_MODE must be 'E' or 'FILE'.")
+
+def xyz_from_spectral_factor(F, xbar, ybar, zbar, illum, grid_step_nm):
+    """
+    F is a spectral factor in [0,1] (reflectance OR transmittance).
+    For absorbance-derived color, we will pass F = T(λ).
+    """
+    #F = np.clip(np.asarray(F, float), 0.0, 1.0)
+    F = np.asarray(F, float)
+    S = np.clip(np.asarray(illum, float), 0.0, np.inf)
+
+    denom = np.sum(S * ybar) * grid_step_nm
+    if denom <= EPS:
+        return np.array([np.nan, np.nan, np.nan], float)
+
+    k = 1.0 / denom  # ensures perfect diffuser/transmitter gives Y=1
+    X = k * np.sum(F * S * xbar) * grid_step_nm
+    Y = k * np.sum(F * S * ybar) * grid_step_nm
+    Z = k * np.sum(F * S * zbar) * grid_step_nm
+    return np.array([X, Y, Z], float)
+
+def xyz_to_srgb_D65(XYZ):
+    """
+    XYZ referenced to D65 -> sRGB (clipped).
+    """
+    X, Y, Z = np.asarray(XYZ, float)
+    M = np.array([
+        [ 3.2406, -1.5372, -0.4986],
+        [-0.9689,  1.8758,  0.0415],
+        [ 0.0557, -0.2040,  1.0570],
+    ], float)
+    rgb_lin = M @ np.array([X, Y, Z], float)
+
+    def gamma(u):
+        u = np.asarray(u, float)
+        return np.where(u <= 0.0031308, 12.92*u,
+                        1.055*np.power(np.maximum(u, 0), 1/2.4) - 0.055)
+
+    return np.clip(gamma(rgb_lin), 0.0, 1.0)
+
+def white_xyz_from_illuminant(xbar, ybar, zbar, illum, grid_step_nm):
+    """
+    Whitepoint under your illuminant for factor=1, normalized so Y=1.
+    """
+    S = np.clip(np.asarray(illum, float), 0.0, np.inf)
+    X = np.sum(S * xbar) * grid_step_nm
+    Y = np.sum(S * ybar) * grid_step_nm
+    Z = np.sum(S * zbar) * grid_step_nm
+    if Y <= EPS:
+        return np.array([np.nan, np.nan, np.nan], float)
+    return np.array([X / Y, 1.0, Z / Y], float)
+
+def bradford_adapt_XYZ(XYZ, src_white_XYZ, dst_white_XYZ):
+    """
+    Adapt XYZ from src illuminant white to dst white (Bradford).
+    """
+    XYZ = np.asarray(XYZ, float)
+    src = np.asarray(src_white_XYZ, float)
+    dst = np.asarray(dst_white_XYZ, float)
+
+    M = np.array([[ 0.8951,  0.2664, -0.1614],
+                  [-0.7502,  1.7135,  0.0367],
+                  [ 0.0389, -0.0685,  1.0296]], float)
+    Minv = np.linalg.inv(M)
+
+    src_LMS = M @ src
+    dst_LMS = M @ dst
+    D = np.diag(dst_LMS / np.clip(src_LMS, EPS, np.inf))
+
+    return Minv @ (D @ (M @ XYZ))
+
+def color_from_factor(F, xbar, ybar, zbar, illum, grid_step_nm):
+    """
+    Computes sRGB using chromatic adaptation to D65 if illuminant != D65.
+    """
+    D65_WHITE = np.array([0.95047, 1.00000, 1.08883], float)
+
+    XYZ_src = xyz_from_spectral_factor(F, xbar, ybar, zbar, illum, grid_step_nm)
+    src_white = white_xyz_from_illuminant(xbar, ybar, zbar, illum, grid_step_nm)
+
+    XYZ_d65 = bradford_adapt_XYZ(XYZ_src, src_white, D65_WHITE)
+    rgb = xyz_to_srgb_D65(XYZ_d65)
+    return rgb, XYZ_d65
+
+def xy_from_xyz(xyz: np.ndarray):
+    X, Y, Z = xyz
+    s = X + Y + Z
+    if s <= EPS:
+        return (np.nan, np.nan)
+    return (float(X/s), float(Y/s))
+
+# ============================================================
+# Plotting
+# ============================================================
+
+def save_figure_pdf(fig, filename, outdir=PDF_OUTDIR, dpi=300):
+    os.makedirs(outdir, exist_ok=True)
+    outpath = os.path.join(outdir, f"{filename}.pdf")
+    fig.savefig(outpath, dpi=dpi, bbox_inches="tight", facecolor="white")
+
+
+def absorbance_from_reflectance_percent(R_white_pct, R_dyed_pct):
+    """
+    A = log10(R_white / R_dyed) using reflectance in percent.
+    Returns absorbance (unitless). Can be negative if dyed > white at some λ.
+    """
+    Rw = np.asarray(R_white_pct, float)
+    Rd = np.asarray(R_dyed_pct, float)
+    Rw = np.clip(Rw, EPS, None)
+    Rd = np.clip(Rd, EPS, None)
+    return np.log10(Rw / Rd)
+
+def transmittance_from_absorbance(A, K=1.0):
+    """
+    T = 10^(-K*A)
+    Returns factor in (0, inf). For color integration we clip to [0,1].
+    """
+    A = np.asarray(A, float)
+    T = 10 ** (-K * A)
+    return T
+
+def plot_absorbance_pipeline_percent(
+    grid_nm, sample_pct, adv0_pct,
+    A, T,
+    rgb_sample, rgb_T,
+    label_name,
+):
+    fig = plt.figure(figsize=(7, 4))
+    gs = fig.add_gridspec(2, 1, height_ratios=[1, 1])
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+
+    # Panel a: Reflectance (%)
+    ax1.plot(grid_nm, adv0_pct, color="black", label="Control PHB1")
+    ax1.plot(
+        grid_nm,
+        sample_pct,
+        color="black",
+        linestyle="--",
+        label=f"{label_name}"
+    )
+    ax1.set_ylabel("Reflectance (%)")
+    ax1.text(
+        0.01, 0.98, "a)",
+        transform=ax1.transAxes,
+        ha="left", va="top",
+        fontsize=10,
+        zorder=10,
+        clip_on=False
+    )
+    ax1.legend(loc="upper right", fontsize=8)
+
+    # Panel b: Absorbance
+    ax2.plot(
+        grid_nm,
+        A,
+        color='black',
+        linewidth=5,
+        
+    )
+    ax2.plot(
+        grid_nm,
+        A,
+        color=tuple(rgb_T),
+        linewidth=3,
+        label=(
+            rf"$A=\log_{{10}}\!\left(\frac{{\mathrm{{Control\ PHB1}}}}"
+            rf"{{\mathrm{{{label_name}}}}}\right)$"
+            "\n"
+            f"sRGB=({rgb_T[0]:.3f}, {rgb_T[1]:.3f}, {rgb_T[2]:.3f})"
+        )
+    )
+    ax2.set_ylabel("Absorbance")
+    ax2.set_xlabel("Wavelength (nm)")
+    ax2.text(
+        0.01, 0.98, "b)",
+        transform=ax2.transAxes,
+        ha="left", va="top",
+        fontsize=10,
+        zorder=10,
+        clip_on=False
+    )
+    ax2.legend(loc="upper right", fontsize=8)
+
+    fig.tight_layout()
+
+    save_figure_pdf(fig, f"{label_name}_uvvis_reflectance")
+
+    if SHOW_PLOTS:
+        plt.show()
+    # plt.close(fig))
+    
+
+
+def plot_all_absorbance_4x4(grid_nm, A_list, labels, rgb_list,
+                            outpath=None, figsize=(7, 7),
+                            nrows=4, ncols=4, lw=1.6, show=True):
+    """
+    Plots each absorbance spectrum in its own subplot (4x4 by default),
+    with the line colored by the corresponding rgb_T.
+    """
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, sharex=True, sharey=False)
+    axes = np.array(axes).reshape(nrows, ncols)
+
+    for i in range(nrows * ncols):
+        r, c = divmod(i, ncols)
+        ax = axes[r, c]
+
+        if i < len(A_list):
+            A = np.asarray(A_list[i], float)
+            rgb = tuple(np.clip(np.asarray(rgb_list[i], float), 0.0, 1.0))
+            ax.plot(grid_nm, A, color='black', linewidth=2.6)
+            ax.plot(grid_nm, A, color=rgb, linewidth=lw)
+            # subplot label (a), b), c)...) in top-right corner
+            letters = list(string.ascii_lowercase)
+            ax.set_xlabel("Wavelength (nm)")
+            ax.set_ylabel("Absorbance")
+            ax.text(
+                0.95, 0.95,
+                f"{letters[i]})",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=10
+            )
+            ax.set_ylim(-0.05,0.85)
+        else:
+            ax.axis("off")
+            continue
+
+    plt.tight_layout()
+    save_figure_pdf(fig, f"4_4_uvviv_absorbance")
+    plt.show()
+    
+   
+
+    
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    grid_nm = np.arange(WL_MIN, WL_MAX + GRID_STEP_NM, GRID_STEP_NM)
+
+    # CMFs + illuminant
+    xbar, ybar, zbar = load_cmf_to_grid(CMF_PATH, grid_nm)
+    illum = load_illuminant_to_grid(ILLUMINANT_MODE, grid_nm)
+
+    # baseline
+    baseline_fp, baseline = load_baseline(grid_nm)
+
+    # collect files
+    files = []
+    for ext in ("*.csv", "*.txt", "*.dat"):
+        files.extend(glob.glob(os.path.join(DATA_FOLDER, ext)))
+    if not files:
+        raise FileNotFoundError(f"No spectrum files found in {DATA_FOLDER}")
+
+    # load spectra to grid
+    spectra_raw = {}
+    for fp in files:
+        if os.path.basename(fp).lower() == BASELINE_FILENAME.lower():
+            continue
+        adv, label_name = adv_id_and_label_from_filename(fp)
+        if not adv:
+            continue
+        wl, y = read_two_col_spectrum(fp)
+        #wl, y = clip_and_normalize(wl, y, WL_MIN, WL_MAX)
+        y_grid = interp_to_grid(wl, y, grid_nm)
+        spectra_raw[adv] = y_grid
+
+    if "ADV0" not in spectra_raw:
+        raise FileNotFoundError("ADV0 not found (filename must contain ADV0).")
+
+    out_dir = os.path.join(DATA_FOLDER, "delta_as_absorbance_color")
+    plot_dir = os.path.join(out_dir, "plots")
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
+
+    adv0_raw = spectra_raw["ADV0"]
+    adv0_bl = subtract_baseline(adv0_raw, baseline)
+
+    candidates = sorted([k for k in spectra_raw.keys() if k != "ADV0"],
+                        key=lambda s: int(re.sub(r"\D", "", s) or "0"))
+
+
+    summary_path = os.path.join(out_dir, "summary_absorbance_color.csv")
+    header_written = False
+
+    with open(summary_path, "w", encoding="utf-8") as fsum:
+        for adv in candidates:
+            label_name = ADV_LABEL_MAP.get(adv, adv)
+            sample_raw = spectra_raw[adv]
+            sample_bl = subtract_baseline(sample_raw, baseline)
+
+            # delta_raw = ADV0 - dyed
+            # ---- convert to percent for plotting ----
+            adv0_pct   = adv0_bl /100
+            sample_pct = sample_bl /100.0
+            
+            # ---- delta in percent ----
+            #delta_pct = adv0_pct - sample_pct   # can be negative
+            
+            # ---- absorbance from reflectance ratio (percent cancels) ----
+            A = absorbance_from_reflectance_percent(adv0_pct, sample_pct)
+            
+            # ---- transmittance factor for color ----
+            T = transmittance_from_absorbance(A, K=K_ABSORBANCE)
+            
+            # for color integration, T must be a spectral factor in [0,1]
+            #T_clip = np.clip(T, 0.0, 1.0)
+            
+            rgb_sample, _ = color_from_factor(np.clip(sample_bl, 0, 1), xbar, ybar, zbar, illum, GRID_STEP_NM)
+            rgb_T, XYZ_d65 = color_from_factor(T, xbar, ybar, zbar, illum, GRID_STEP_NM)
+            xy = xy_from_xyz(XYZ_d65)
+
+
+
+            # Summary row
+            row = {
+                "sample": adv,
+                "baseline_used": os.path.basename(baseline_fp) if baseline_fp else "",
+                "K_absorbance": K_ABSORBANCE,
+                "xy_x": xy[0],
+                "xy_y": xy[1],
+                "sRGB_R": float(rgb_T[0]),
+                "sRGB_G": float(rgb_T[1]),
+                "sRGB_B": float(rgb_T[2]),
+            }
+
+            if not header_written:
+                fsum.write(",".join(row.keys()) + "\n")
+                header_written = True
+            fsum.write(",".join(str(row[k]) for k in row.keys()) + "\n")
+            rgb_sample, _ = color_from_factor(sample_bl, xbar, ybar, zbar, illum, GRID_STEP_NM)
+            
+            plot_absorbance_pipeline_percent(
+                grid_nm=grid_nm,
+                sample_pct=sample_pct,
+                adv0_pct=adv0_pct,
+                #delta_pct=delta_pct,
+                A=A,
+                T=T,
+                rgb_sample=rgb_sample,
+                rgb_T=rgb_T,
+                label_name=label_name,
+            )
+            print(f"{adv}: sRGB={tuple(np.round(rgb_T, 3))}  xy=({xy[0]:.3f},{xy[1]:.3f})")
+    print(f"\nDone. Outputs in: {out_dir}")
+    print(f"Summary: {summary_path}")
+    # ... inside main(), before "with open(summary_path, ...)"
+    A_scans = []
+    A_labels = []
+    A_rgb = []
+    
+    with open(summary_path, "w", encoding="utf-8") as fsum:
+        for adv in candidates:
+            label_name = ADV_LABEL_MAP.get(adv, adv)
+            sample_raw = spectra_raw[adv]
+            sample_bl = subtract_baseline(sample_raw, baseline)
+    
+            # reflectance is in percent already in your files
+            adv0_pct   = adv0_bl / 100.0
+            sample_pct = sample_bl / 100.0
+    
+            A = absorbance_from_reflectance_percent(adv0_pct, sample_pct)
+            T = transmittance_from_absorbance(A, K=K_ABSORBANCE)
+    
+            rgb_T, XYZ_d65 = color_from_factor(T, xbar, ybar, zbar, illum, GRID_STEP_NM)
+            xy = xy_from_xyz(XYZ_d65)
+    
+            # collect for 4x4 grid
+            A_scans.append(A)
+            A_labels.append(label_name)
+            A_rgb.append(rgb_T)
+    
+            # --- write row, make per-sample plot, etc. ---
+            # (keep your existing code here)
+    
+    # after the loop, make the 4x4 absorbance grid
+    out_overlay = os.path.join(plot_dir, "ALL_absorbance_4x4.pdf")
+    plot_all_absorbance_4x4(
+        grid_nm=grid_nm,
+        A_list=A_scans,
+        labels=A_labels,
+        rgb_list=A_rgb,
+        outpath=out_overlay,
+        figsize=(7, 7),
+        nrows=4, ncols=4,
+        show=SHOW_PLOTS
+    )
+
+    # List of RGB tuples, e.g. [(r,g,b), ...] with values in [0,1]
+
+    #save_swatch_grid_4x4(rgb_T, label_name, os.path.join(PDF_OUTDIR, "adv_color_swatches_4x4.pdf"))
+if __name__ == "__main__":
+    main()
